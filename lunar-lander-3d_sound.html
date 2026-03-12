@@ -1,0 +1,1384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LUNAR LANDER 3D — VECTREX</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    background:#000;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    min-height:100vh; font-family:'Share Tech Mono',monospace; overflow:hidden;
+  }
+  canvas { display:block; cursor:none; }
+  .scanlines {
+    position:fixed; inset:0; pointer-events:none; z-index:100;
+    background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.06) 2px,rgba(0,0,0,0.06) 4px);
+  }
+  .vignette {
+    position:fixed; inset:0; pointer-events:none; z-index:101;
+    background:radial-gradient(ellipse at center,transparent 55%,rgba(0,0,0,0.75) 100%);
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="scanlines"></div>
+<div class="vignette"></div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+  W = canvas.width  = Math.min(window.innerWidth,  window.innerHeight * 1.05) | 0;
+  H = canvas.height = Math.min(window.innerHeight, window.innerWidth  / 1.05) | 0;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ═══════════════════════════════════════════════════════
+//  VECTREX DRAW PRIMITIVES
+// ═══════════════════════════════════════════════════════
+function vLine(x1,y1,x2,y2, col='#00ff78', glow=12, w=1.2, alpha=1) {
+  ctx.save();
+  ctx.strokeStyle = col; ctx.shadowColor = col; ctx.lineJoin='round'; ctx.lineCap='round';
+  [[w+glow*0.28, 0.15, glow],
+   [w*0.7,       0.50, glow*0.4],
+   [w*0.35,      alpha,glow*0.15]].forEach(([lw,a,bl])=>{
+    ctx.lineWidth=lw; ctx.globalAlpha=a; ctx.shadowBlur=bl;
+    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+  });
+  ctx.restore();
+}
+function vText(txt,x,y,size=13,col='#00ff78',glow=10) {
+  ctx.save();
+  ctx.font=`${size}px 'Share Tech Mono',monospace`;
+  ctx.textAlign='center'; ctx.fillStyle=col; ctx.shadowColor=col;
+  [glow*1.5,glow*0.5,glow*0.1].forEach((bl,i)=>{
+    ctx.shadowBlur=bl; ctx.globalAlpha=i===0?0.3:i===1?0.75:1; ctx.fillText(txt,x,y);
+  });
+  ctx.restore();
+}
+
+// ═══════════════════════════════════════════════════════
+//  MATH
+// ═══════════════════════════════════════════════════════
+function v3(x,y,z){return{x,y,z};}
+function vadd(a,b){return v3(a.x+b.x,a.y+b.y,a.z+b.z);}
+function vsub(a,b){return v3(a.x-b.x,a.y-b.y,a.z-b.z);}
+function vscale(a,s){return v3(a.x*s,a.y*s,a.z*s);}
+function vlen(a){return Math.sqrt(a.x*a.x+a.y*a.y+a.z*a.z);}
+function vnorm(a){const l=vlen(a)||1;return vscale(a,1/l);}
+function vcross(a,b){return v3(a.y*b.z-a.z*b.y,a.z*b.x-a.x*b.z,a.x*b.y-a.y*b.x);}
+function vdot(a,b){return a.x*b.x+a.y*b.y+a.z*b.z;}
+
+// Rotation helpers
+function rotX(v,a){const c=Math.cos(a),s=Math.sin(a);return v3(v.x,v.y*c-v.z*s,v.y*s+v.z*c);}
+function rotY(v,a){const c=Math.cos(a),s=Math.sin(a);return v3(v.x*c+v.z*s,v.y,-v.x*s+v.z*c);}
+function rotZ(v,a){const c=Math.cos(a),s=Math.sin(a);return v3(v.x*c-v.y*s,v.x*s+v.y*c,v.z);}
+
+function applyRotation(v, rx, ry, rz) {
+  return rotZ(rotX(rotY(v, ry), rx), rz);
+}
+
+// ═══════════════════════════════════════════════════════
+//  CAMERA / PROJECTION
+// ═══════════════════════════════════════════════════════
+const cam = { fov: 700 };
+
+function project(world, camPos, camYaw, camPitch) {
+  // Translate to camera space
+  let p = vsub(world, camPos);
+  // Rotate by camera orientation
+  p = rotY(p, -camYaw);
+  p = rotX(p, -camPitch);
+  if (p.z <= 0.5) return null; // behind camera
+  const scale = cam.fov / p.z;
+  return { x: W/2 + p.x * scale, y: H/2 - p.y * scale, z: p.z, scale };
+}
+
+// ═══════════════════════════════════════════════════════
+//  TERRAIN GENERATION
+// ═══════════════════════════════════════════════════════
+const GRID = 24;        // NxN grid cells
+const TERRAIN_SIZE = 200;
+let terrain = { heights:[], pads:[] };
+
+function genTerrain(d) {
+  const N = GRID + 1;
+  const h = [];
+  // Terrain noise — amplitude and frequency scale with difficulty
+  const p = getP();
+  const amp  = p.terrainAmp;
+  const freq = p.terrainFreq;
+  for (let z = 0; z < N; z++) {
+    h[z] = [];
+    for (let x = 0; x < N; x++) {
+      const nx = x/(N-1), nz = z/(N-1);
+      let ht = 0;
+      ht += Math.sin(nx*3.1*freq)*Math.cos(nz*2.7*freq) * 8  * amp;
+      ht += Math.sin(nx*7*freq+1)*Math.cos(nz*5*freq+2) * 4  * amp;
+      ht += Math.sin(nx*13*freq+3)*Math.cos(nz*11*freq+1)*2  * amp;
+      ht += (Math.random()-0.5) * 3 * amp;
+      h[z][x] = ht;
+    }
+  }
+
+  // Flat landing pads
+  const numPads = d <= 4 ? 2 : 1;
+  const padR = d <= 2 ? 3 : d <= 5 ? 2 : 1;
+  const pads = [];
+  const usedCells = new Set();
+  for (let p = 0; p < numPads; p++) {
+    let cx, cz, tries=0;
+    do {
+      cx = padR + 2 + Math.floor(Math.random()*(GRID-padR*2-4));
+      cz = padR + 2 + Math.floor(Math.random()*(GRID-padR*2-4));
+      tries++;
+    } while([...usedCells].some(k=>{const[px,pz]=k.split(',').map(Number);return Math.abs(px-cx)<padR*2+3&&Math.abs(pz-cz)<padR*2+3;}) && tries<30);
+
+    const avgH = (() => {
+      let s=0,n=0;
+      for(let dz=-padR;dz<=padR;dz++) for(let dx=-padR;dx<=padR;dx++){s+=h[cz+dz][cx+dx];n++;}
+      return s/n;
+    })();
+    for(let dz=-padR;dz<=padR;dz++) for(let dx=-padR;dx<=padR;dx++) h[cz+dz][cx+dx]=avgH;
+    pads.push({cx,cz,r:padR,y:avgH,
+      wx: (cx/(N-1)-0.5)*TERRAIN_SIZE,
+      wz: (cz/(N-1)-0.5)*TERRAIN_SIZE });
+    for(let dz=-padR-2;dz<=padR+2;dz++) for(let dx=-padR-2;dx<=padR+2;dx++) usedCells.add(`${cx+dx},${cz+dz}`);
+  }
+  return { heights: h, pads, N };
+}
+
+function terrainWorldY(wx, wz) {
+  const N = terrain.N;
+  const fx = (wx/TERRAIN_SIZE + 0.5) * (N-1);
+  const fz = (wz/TERRAIN_SIZE + 0.5) * (N-1);
+  const ix = Math.floor(fx), iz = Math.floor(fz);
+  const tx = fx-ix, tz = fz-iz;
+  if(ix<0||ix>=N-1||iz<0||iz>=N-1) return 0;
+  const h=terrain.heights;
+  return h[iz][ix]*(1-tx)*(1-tz) + h[iz][ix+1]*tx*(1-tz) +
+         h[iz+1][ix]*(1-tx)*tz   + h[iz+1][ix+1]*tx*tz;
+}
+
+// ═══════════════════════════════════════════════════════
+//  LANDER
+// ═══════════════════════════════════════════════════════
+const LANDER_GEOM = {
+  // Body: triangle prism (8 lines)
+  edges: [
+    // Top apex to base triangle
+    [v3(0,1.6,0),  v3(-1,-0.5, 1)],
+    [v3(0,1.6,0),  v3( 1,-0.5, 1)],
+    [v3(0,1.6,0),  v3( 0,-0.5,-1.2)],
+    // Base triangle
+    [v3(-1,-0.5,1),  v3(1,-0.5,1)],
+    [v3( 1,-0.5,1),  v3(0,-0.5,-1.2)],
+    [v3( 0,-0.5,-1.2), v3(-1,-0.5,1)],
+    // Legs (4)
+    [v3(-1,-0.5,1),  v3(-1.8,-1.4,1.8)],
+    [v3( 1,-0.5,1),  v3( 1.8,-1.4,1.8)],
+    [v3( 0,-0.5,-1.2),v3(0,-1.4,-2.0)],
+    // Leg pads
+    [v3(-2.2,-1.4,1.4),v3(-1.4,-1.4,2.2)],
+    [v3( 1.4,-1.4,2.2),v3( 2.2,-1.4,1.4)],
+    [v3(-0.4,-1.4,-2.2),v3(0.4,-1.4,-2.2)],
+    // Nozzle
+    [v3(-0.35,-0.5,0),v3(-0.35,-0.9,0)],
+    [v3( 0.35,-0.5,0),v3( 0.35,-0.9,0)],
+    [v3(-0.35,-0.9,0),v3( 0.35,-0.9,0)],
+  ]
+};
+
+// ═══════════════════════════════════════════════════════
+//  PARTICLES
+// ═══════════════════════════════════════════════════════
+let particles = [];
+function spawnThrust(pos, up) {
+  for(let i=0;i<3;i++){
+    const scatter = v3((Math.random()-.5)*2,(Math.random()-.5)*2,(Math.random()-.5)*2);
+    const dir = vnorm(vadd(vscale(up,-1), vscale(scatter,0.4)));
+    const spd = 0.4+Math.random()*0.6;
+    particles.push({pos:{...pos}, vel:vscale(dir,spd), life:1, decay:0.06+Math.random()*0.06, type:'thrust'});
+  }
+}
+function spawnExplosion(pos) {
+  for(let i=0;i<50;i++){
+    const dir = vnorm(v3(Math.random()-.5,Math.random()-.5,Math.random()-.5));
+    const spd = 0.3+Math.random()*2.5;
+    particles.push({pos:{...pos}, vel:vscale(dir,spd), life:1, decay:0.015+Math.random()*0.03, type:'exp'});
+  }
+}
+function spawnLanding(pos) {
+  for(let i=0;i<25;i++){
+    const dir = vnorm(v3(Math.random()-.5, Math.random()*0.5+0.2, Math.random()-.5));
+    const spd = 0.2+Math.random()*1.5;
+    particles.push({pos:{...pos}, vel:vscale(dir,spd), life:1, decay:0.025+Math.random()*0.03, type:'land'});
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+//  GAMEPAD
+// ═══════════════════════════════════════════════════════
+function getGamepad() {
+  const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+  for(const gp of gps) if(gp) return gp;
+  return null;
+}
+function gpAxis(gp, i, dead=0.12) {
+  if(!gp||i>=gp.axes.length) return 0;
+  const v = gp.axes[i];
+  return Math.abs(v) < dead ? 0 : v;
+}
+function gpBtn(gp, i) { return gp && i < gp.buttons.length && gp.buttons[i].pressed; }
+
+// ═══════════════════════════════════════════════════════
+//  DIFFICULTY
+// ═══════════════════════════════════════════════════════
+let difficulty = 1;
+function getP() {
+  const d = difficulty;
+  const t = ((d-1)/8)**1.5;   // 0..1 curve
+  return {
+    // Physics — mild range, difficulty mainly affects terrain
+    gravity:      0.010 + t*0.012,          // d1:0.010  d9:0.022
+    thrust:       0.058 - t*0.010,          // d1:0.058  d9:0.048
+    rotate:       0.060 - t*0.008,          // d1:0.060  d9:0.052
+    safeVY:       3.2  - t*1.0,             // d1:3.2    d9:2.2  (generous)
+    safeVXZ:      2.8  - t*0.8,             // d1:2.8    d9:2.0
+    safeAngle:    0.70 - t*0.30,            // d1:0.70   d9:0.40
+    fuelRate:     0.12 + t*0.18,            // d1:0.12   d9:0.30
+    initFuel:     Math.round(220 - t*80),   // d1:220    d9:140
+    initVXZ:      t*0.25,
+    padWidth:     d<=2?3:d<=5?2:1,
+    numPads:      d<=4?2:1,
+    // Terrain roughness — this is the main difficulty lever
+    terrainAmp:   1.0 + t*5.0,             // d1:1×   d9:6×  amplitude multiplier
+    terrainFreq:  1.0 + t*1.8,             // d1:1×   d9:2.8× frequency multiplier
+  };
+}
+
+// ═══════════════════════════════════════════════════════
+//  GAME STATE
+// ═══════════════════════════════════════════════════════
+let state = 'title';
+let lander, camPos, camYaw, camPitch, camDist;
+let score = 0, frameCount = 0;
+let gamepadConnected = false;
+let topviewT    = 0;      // 0=normal .. 1=full overhead (smooth lerp)
+let renderPitch = 0.35;   // effective pitch used for projection (blended)
+
+// ═══════════════════════════════════════════════════════
+//  AUDIO — SONAR ALTIMETER
+// ═══════════════════════════════════════════════════════
+let audioCtx = null;
+let sonarNextTime = 0;       // when to fire the next ping (in audioCtx.currentTime seconds)
+const SONAR_MAX_ALT = 120;   // above this height: silence
+
+let audioEnabled = true;
+let audioReady    = false;
+
+function unlockAudio() {
+  if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if(audioCtx.state !== 'running') {
+    audioCtx.resume().then(() => { audioReady = true; });
+  } else {
+    audioReady = true;
+  }
+}
+
+// Unlock on ANY click or touch anywhere on the page — most reliable gesture
+document.addEventListener('click',     unlockAudio, { once: false, passive: true });
+document.addEventListener('touchstart', unlockAudio, { once: false, passive: true });
+document.addEventListener('keydown',    unlockAudio, { once: false, passive: true });
+
+function getAudioCtx() {
+  unlockAudio();
+  return audioCtx;
+}
+
+function fireSonarPing(alt) {
+  if(!audioReady) return;
+  const ac  = getAudioCtx();
+  const t   = Math.max(0, Math.min(1, 1 - alt / SONAR_MAX_ALT));
+  const freq = 280 + t * 820;          // 280 Hz far .. 1100 Hz near
+  const vol  = 0.18 + t * 0.28;
+  const now  = ac.currentTime;
+
+  // ── Delay/echo node (2 taps) ──────────────────────────────────
+  const echoDelay1 = ac.createDelay(1.0);
+  const echoDelay2 = ac.createDelay(1.0);
+  const echoGain1  = ac.createGain();
+  const echoGain2  = ac.createGain();
+
+  // Echo spacing grows with altitude (roomier space when high up)
+  const echoTime = 0.18 + (1 - t) * 0.22;   // 0.18s close .. 0.40s far
+  echoDelay1.delayTime.value = echoTime;
+  echoDelay2.delayTime.value = echoTime * 2;
+  echoGain1.gain.value  = 0.38;
+  echoGain2.gain.value  = 0.14;
+
+  // ── Oscillator ────────────────────────────────────────────────
+  const osc  = ac.createOscillator();
+  const gain = ac.createGain();
+
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(freq, now);
+  osc.frequency.exponentialRampToValueAtTime(freq * 0.55, now + 0.09);
+
+  gain.gain.setValueAtTime(vol, now);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.18);
+
+  // Routing: osc → gain → [direct + echo1 + echo2] → destination
+  osc.connect(gain);
+  gain.connect(ac.destination);          // direct
+  gain.connect(echoDelay1);
+  echoDelay1.connect(echoGain1);
+  echoGain1.connect(ac.destination);     // first echo
+  gain.connect(echoDelay2);
+  echoDelay2.connect(echoGain2);
+  echoGain2.connect(ac.destination);     // second echo
+
+  osc.start(now);
+  osc.stop(now + echoTime * 2 + 0.25);   // keep alive until last echo fades
+}
+
+function updateSonar(alt) {
+  if(!audioEnabled || state !== 'playing' || alt > SONAR_MAX_ALT) { sonarNextTime = 0; return; }
+  const ac = getAudioCtx();
+  const now = ac.currentTime;
+  if(now < sonarNextTime) return;
+
+  // Interval: 1.8s when far, shrinks to 0.12s when very close
+  const t = Math.max(0, Math.min(1, 1 - alt / SONAR_MAX_ALT));
+  const interval = 1.8 - t * 1.68;   // 1.8s .. 0.12s
+
+  fireSonarPing(alt);
+  sonarNextTime = now + interval;
+}
+
+// ── Thruster sound ────────────────────────────────────────────────
+let thrusterOsc   = null;
+let thrusterGain  = null;
+let thrusterNoiseNode = null;
+
+function createNoiseBuffer(ac) {
+  const bufLen = ac.sampleRate * 0.5;
+  const buf = ac.createBuffer(1, bufLen, ac.sampleRate);
+  const data = buf.getChannelData(0);
+  for(let i = 0; i < bufLen; i++) data[i] = Math.random() * 2 - 1;
+  return buf;
+}
+
+function startThrusterSound() {
+  if(!audioEnabled || !audioReady) return;
+  if(thrusterNoiseNode) return;  // already running
+  const ac  = getAudioCtx();
+  const now = ac.currentTime;
+
+  // ── Pure noise thruster ────────────────────────────────────────
+  // White noise → lowpass (body) + bandpass (hiss mid) + highpass (exhaust top)
+  // All three layers mixed together for a full rocket roar
+
+  const noiseBuf = createNoiseBuffer(ac);
+
+  // Master gain (fade in)
+  thrusterGain = ac.createGain();
+  thrusterGain.gain.setValueAtTime(0, now);
+  thrusterGain.gain.linearRampToValueAtTime(1.0, now + 0.08);
+  thrusterGain.connect(ac.destination);
+
+  // ── Layer 1: low rumble — lowpass ~120 Hz ──
+  thrusterNoiseNode = ac.createBufferSource();
+  thrusterNoiseNode.buffer = noiseBuf;
+  thrusterNoiseNode.loop = true;
+  const lpf = ac.createBiquadFilter();
+  lpf.type = 'lowpass'; lpf.frequency.value = 120; lpf.Q.value = 0.7;
+  const g1 = ac.createGain(); g1.gain.value = 0.55;
+  thrusterNoiseNode.connect(lpf); lpf.connect(g1); g1.connect(thrusterGain);
+
+  // ── Layer 2: mid combustion hiss — bandpass ~700 Hz ──
+  const n2 = ac.createBufferSource();
+  n2.buffer = noiseBuf; n2.loop = true;
+  const bpf = ac.createBiquadFilter();
+  bpf.type = 'bandpass'; bpf.frequency.value = 700; bpf.Q.value = 1.2;
+  const g2 = ac.createGain(); g2.gain.value = 0.30;
+  n2.connect(bpf); bpf.connect(g2); g2.connect(thrusterGain);
+
+  // ── Layer 3: high exhaust crack — highpass ~3200 Hz ──
+  const n3 = ac.createBufferSource();
+  n3.buffer = noiseBuf; n3.loop = true;
+  const hpf = ac.createBiquadFilter();
+  hpf.type = 'highpass'; hpf.frequency.value = 3200; hpf.Q.value = 0.5;
+  const g3 = ac.createGain(); g3.gain.value = 0.12;
+  n3.connect(hpf); hpf.connect(g3); g3.connect(thrusterGain);
+
+  thrusterNoiseNode.start(now);
+  n2.start(now); n3.start(now);
+
+  // Store extra nodes for stopping
+  thrusterNoiseNode._extras = [n2, n3];
+}
+
+function stopThrusterSound() {
+  if(!thrusterNoiseNode) return;
+  const ac  = getAudioCtx();
+  const now = ac.currentTime;
+  thrusterGain.gain.linearRampToValueAtTime(0, now + 0.18);
+  thrusterNoiseNode.stop(now + 0.20);
+  if(thrusterNoiseNode._extras) thrusterNoiseNode._extras.forEach(n => n.stop(now + 0.20));
+  thrusterNoiseNode = null;
+  thrusterOsc = null;
+}
+let topviewHeld = false;  // is R3 held?
+let prevL3      = false;  // edge detect for L3
+
+window.addEventListener('gamepadconnected', ()=>{ gamepadConnected=true; });
+window.addEventListener('gamepaddisconnected', ()=>{ gamepadConnected=false; });
+
+function initGame() {
+  unlockAudio();  // ensure AudioContext is running
+  stopMusic();    // stop title music when game starts
+  const soundBtnEl = document.getElementById('soundOnBtn');
+  if(soundBtnEl) soundBtnEl.style.display = 'none';
+  const p = getP();
+  terrain = genTerrain(difficulty);
+  particles = [];
+  frameCount = 0;
+
+  // Start above center
+  const startY = 60;
+  lander = {
+    pos: v3((Math.random()-.5)*20, startY, (Math.random()-.5)*20),
+    vel: v3((Math.random()-.5)*p.initVXZ*2, -0.1, (Math.random()-.5)*p.initVXZ*2),
+    // Orientation as euler angles (pitch, yaw, roll)
+    pitch: 0, yaw: Math.random()*Math.PI*2, roll: 0,
+    fuel: p.initFuel,
+    thrusting: false,
+    dead: false,
+    landed: false,
+    scale: 1.8,
+  };
+
+  // Camera follows lander from behind/above
+  camYaw   = lander.yaw;
+  camPitch = 0.35;
+  camDist  = 55;
+  updateCamera();
+
+  state = 'playing';
+  hideOverlay();
+}
+
+function updateCamera() {
+  // Topview blend: R3 held -> slide to overhead, released -> slide back
+  const targetT = topviewHeld ? 1 : 0;
+  topviewT += (targetT - topviewT) * 0.075;  // ~60 frames to full overhead
+
+  // Normal orbit (clamped)
+  const normalPitch = Math.max(0.05, Math.min(1.2, camPitch));
+
+  // Topview: straight down at ~105 units above lander
+  // visible radius = 105 * (W/2) / fov ~= 36 units ~= 10x lander scale
+  const topDist  = 105;
+  const blendPitch = normalPitch + (Math.PI * 0.5 - normalPitch) * topviewT;
+  renderPitch = blendPitch; // used by proj() for correct perspective
+  const blendDist  = camDist     + (topDist - camDist)           * topviewT;
+
+  // Orbit position (normal view)
+  const orbitX = lander.pos.x - Math.sin(camYaw) * blendDist * Math.cos(blendPitch);
+  const orbitY = lander.pos.y + Math.sin(blendPitch) * blendDist;
+  const orbitZ = lander.pos.z - Math.cos(camYaw) * blendDist * Math.cos(blendPitch);
+
+  // Exact overhead position (topview) — directly above, no XZ offset
+  const topX = lander.pos.x;
+  const topY = lander.pos.y + topDist;
+  const topZ = lander.pos.z;
+
+  // Blend between orbit and exact overhead based on topviewT
+  const cx = orbitX + (topX - orbitX) * topviewT;
+  const cy = orbitY + (topY - orbitY) * topviewT;
+  const cz = orbitZ + (topZ - orbitZ) * topviewT;
+
+  if(!camPos) { camPos = v3(cx,cy,cz); return; }
+  const lerpSpeed = 0.12 + topviewT * 0.15;
+  camPos.x += (cx - camPos.x) * lerpSpeed;
+  camPos.y += (cy - camPos.y) * lerpSpeed;
+  camPos.z += (cz - camPos.z) * lerpSpeed;
+}
+
+// ═══════════════════════════════════════════════════════
+//  KEYBOARD (fallback)
+// ═══════════════════════════════════════════════════════
+const keys = {};
+document.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','KeyW','KeyA','KeyS','KeyD'].includes(e.code)) e.preventDefault();
+  if(e.code==='Space' && (state==='title'||state==='dead'||state==='landed')) initGame();
+  // (audio unlock handled by global keydown listener)
+}, { passive: false });
+document.addEventListener('keyup', e => { keys[e.code]=false; });
+
+// ═══════════════════════════════════════════════════════
+//  UPDATE
+// ═══════════════════════════════════════════════════════
+function update() {
+  if(state!=='playing') return;
+  frameCount++;
+  const p = getP();
+  const gp = getGamepad();
+
+  // ── Input ──
+  // LEFT STICK  (axes 0,1): tilt lander — roll (X) and pitch (Y)
+  // RIGHT STICK (axes 2,3): orbit camera — yaw (X) and pitch (Y)
+  // RT/R2 button[7] analog or A button[0]: thrust
+  // Keyboard fallback: arrows = tilt lander, WASD = orbit camera, Space = thrust
+
+  const lx = gpAxis(gp, 0) || (keys['ArrowLeft'] ? -0.8 : (keys['ArrowRight'] ? 0.8 : 0));
+  const ly = gpAxis(gp, 1) || (keys['ArrowUp']   ? -0.8 : (keys['ArrowDown']  ? 0.8 : 0));
+  const rx = gpAxis(gp, 2) || (keys['KeyD'] ? 0.6 : (keys['KeyA'] ? -0.6 : 0));
+  const ry = gpAxis(gp, 3) || (keys['KeyS'] ? 0.6 : (keys['KeyW'] ? -0.6 : 0));
+
+  const gpThrust = gp ? ((gp.buttons[7] ? gp.buttons[7].value : 0) || (gp.buttons[0] && gp.buttons[0].pressed ? 1 : 0)) : 0;
+  const thrust_t = gpThrust || (keys['Space'] ? 1 : 0);
+
+  // R3 (right stick click, button 11) — hold for top-down view
+  const r3Now = (gp && gp.buttons[11] && gp.buttons[11].pressed) || keys['KeyV'];
+  topviewHeld = r3Now;
+
+  // L3 (left stick click, button 10) — snap lander back to upright
+  const l3Now = (gp && gp.buttons[10] && gp.buttons[10].pressed) || keys['KeyR'];
+  if(l3Now && !prevL3) {
+    lander.pitch = 0;
+    lander.roll  = 0;
+    // Also gently zero out horizontal velocity (RCS assist)
+    lander.vel.x *= 0.3;
+    lander.vel.z *= 0.3;
+  }
+  prevL3 = l3Now;
+
+  // Right stick: freely orbit camera (only when not sliding to topview)
+  if(topviewT < 0.95) {
+    camYaw   += rx * 0.035;
+    camPitch -= ry * 0.025;
+  }
+
+  // Left stick: tilt the lander (roll on X, pitch on Y)
+  // Roll and pitch are in WORLD-relative tilt, not body-yaw-relative,
+  // so the lander tips in screen-space as expected
+  lander.roll  += lx * p.rotate * 0.9;
+  lander.pitch += ly * p.rotate * 0.9;
+
+  // Auto-level (returns to upright when stick released)
+  lander.pitch *= 0.93;
+  lander.roll  *= 0.93;
+
+  // Hard clamp on easy modes
+  if(difficulty <= 4) {
+    lander.pitch = Math.max(-0.75, Math.min(0.75, lander.pitch));
+    lander.roll  = Math.max(-0.75, Math.min(0.75, lander.roll));
+  }
+
+  // Yaw drifts slowly from roll (natural feel), no direct yaw control
+  lander.yaw += lander.roll * 0.018;
+
+  // Thrust along lander's up axis
+  const up = applyRotation(v3(0,1,0), lander.pitch, lander.yaw, lander.roll);
+  const wasThrusing = lander.thrusting;
+  lander.thrusting = thrust_t > 0.05 && lander.fuel > 0;
+  if(lander.thrusting) {
+    const tpow = p.thrust * thrust_t;
+    lander.vel = vadd(lander.vel, vscale(up, tpow));
+    lander.fuel = Math.max(0, lander.fuel - p.fuelRate * thrust_t);
+    spawnThrust(lander.pos, up);
+    if(!wasThrusing) startThrusterSound();
+  } else {
+    if(wasThrusing) stopThrusterSound();
+  }
+
+  // Gravity
+  lander.vel.y -= p.gravity;
+  // Drag
+  lander.vel = vscale(lander.vel, 0.9985);
+
+  // Move
+  lander.pos = vadd(lander.pos, lander.vel);
+
+  // Bounds clamp (wrap XZ)
+  const HALF = TERRAIN_SIZE*0.5 - 5;
+  if(lander.pos.x > HALF)  lander.pos.x = -HALF;
+  if(lander.pos.x < -HALF) lander.pos.x =  HALF;
+  if(lander.pos.z > HALF)  lander.pos.z = -HALF;
+  if(lander.pos.z < -HALF) lander.pos.z =  HALF;
+
+  // Ground collision
+  const gy = terrainWorldY(lander.pos.x, lander.pos.z);
+  if(lander.pos.y <= gy + lander.scale * 1.5) {
+    const pad = terrain.pads.find(pad => {
+      const dx = lander.pos.x - pad.wx, dz = lander.pos.z - pad.wz;
+      return Math.sqrt(dx*dx+dz*dz) < (pad.r+0.5) * (TERRAIN_SIZE/terrain.N);
+    });
+    const speed = vlen(lander.vel);
+    const normA = Math.max(Math.abs(lander.pitch), Math.abs(lander.roll));
+
+    if(pad && Math.abs(lander.vel.y) < p.safeVY &&
+       Math.sqrt(lander.vel.x**2+lander.vel.z**2) < p.safeVXZ &&
+       normA < p.safeAngle) {
+      // Safe landing
+      stopThrusterSound();
+      lander.pos.y = gy + lander.scale*1.5;
+      lander.vel = v3(0,0,0); lander.pitch=0; lander.roll=0;
+      spawnLanding(lander.pos);
+      const bonus = Math.floor(lander.fuel*5) + Math.floor((p.safeVY - Math.abs(lander.vel.y))*120) + 500;
+      score += bonus;
+      state = 'landed';
+      const nextD = Math.min(9, difficulty + 1);
+      setTimeout(()=>showOverlay(`TOUCHDOWN\n+${bonus} PTS`, `LEVEL ${difficulty} CLEAR — NEXT: ${nextD}`), 500);
+      difficulty = nextD;
+      // Update difficulty button highlight
+      document.querySelectorAll('#diffRow button').forEach((b,i)=>{
+        const active = (i+1)===difficulty;
+        b.style.background  = active ? '#00ff78' : 'transparent';
+        b.style.color       = active ? '#000'    : '#00ff78';
+        b.style.boxShadow   = active ? '0 0 16px #00ff78' : '0 0 6px rgba(0,255,120,0.2)';
+      });
+    } else {
+      stopThrusterSound();
+      spawnExplosion(lander.pos);
+      lander.dead = true; state='dead';
+      setTimeout(()=>showOverlay('CRASH', 'A / SPACE — RETRY'), 700);
+    }
+  }
+
+  // Update particles
+  particles.forEach(pt => {
+    pt.pos = vadd(pt.pos, pt.vel);
+    pt.vel.y -= 0.03;
+    pt.life -= pt.decay;
+  });
+  particles = particles.filter(pt => pt.life > 0);
+
+  // Sonar altimeter
+  const sonarAlt = Math.max(0, lander.pos.y - terrainWorldY(lander.pos.x, lander.pos.z));
+  updateSonar(sonarAlt);
+
+  updateCamera();
+  updateHUD();
+}
+
+function updateHUD() {
+  // HUD updates happen in draw
+}
+
+// ═══════════════════════════════════════════════════════
+//  RENDER
+// ═══════════════════════════════════════════════════════
+function proj(wx, wy, wz) {
+  return project(v3(wx,wy,wz), camPos, camYaw, renderPitch);
+}
+
+function drawTerrain() {
+  const N = terrain.N;
+  const step = TERRAIN_SIZE / (N-1);
+
+  // Draw grid lines
+  for(let iz=0; iz<N; iz++) {
+    for(let ix=0; ix<N; ix++) {
+      const wx = (ix/(N-1) - 0.5) * TERRAIN_SIZE;
+      const wz = (iz/(N-1) - 0.5) * TERRAIN_SIZE;
+      const wy = terrain.heights[iz][ix];
+
+      // Line in X direction
+      if(ix < N-1) {
+        const wx2 = ((ix+1)/(N-1) - 0.5) * TERRAIN_SIZE;
+        const wy2 = terrain.heights[iz][ix+1];
+        const p1 = proj(wx,wy,wz), p2 = proj(wx2,wy2,wz);
+        if(p1&&p2) {
+          const dist = (p1.z+p2.z)*0.5;
+          const fade = Math.max(0.1, Math.min(1, 120/dist));
+          vLine(p1.x,p1.y,p2.x,p2.y,'#00ff78',6*fade,0.8,fade*0.8);
+        }
+      }
+      // Line in Z direction
+      if(iz < N-1) {
+        const wz2 = ((iz+1)/(N-1) - 0.5) * TERRAIN_SIZE;
+        const wy2 = terrain.heights[iz+1][ix];
+        const p1 = proj(wx,wy,wz), p2 = proj(wx,wy2,wz2);
+        if(p1&&p2) {
+          const dist = (p1.z+p2.z)*0.5;
+          const fade = Math.max(0.1, Math.min(1, 120/dist));
+          vLine(p1.x,p1.y,p2.x,p2.y,'#00ff78',6*fade,0.8,fade*0.8);
+        }
+      }
+    }
+  }
+
+  // Landing pads — brighter
+  terrain.pads.forEach(pad => {
+    const r = (pad.r+0.5) * (TERRAIN_SIZE/(N-1));
+    const segs = 16;
+    let prev = null;
+    for(let i=0;i<=segs;i++) {
+      const a = (i/segs)*Math.PI*2;
+      const px = pad.wx + Math.cos(a)*r;
+      const pz = pad.wz + Math.sin(a)*r;
+      const pt = proj(px, pad.y, pz);
+      if(prev&&pt) vLine(prev.x,prev.y,pt.x,pt.y,'#00ffcc',18,2);
+      prev=pt;
+    }
+    // Cross marker
+    const m = proj(pad.wx, pad.y+0.5, pad.wz);
+    if(m) vText('LAND', m.x, m.y, 11, '#00ffcc', 10);
+    // Corner markers
+    [[-r,0,-r],[r,0,-r],[r,0,r],[-r,0,r]].forEach(([dx,,dz])=>{
+      const a = proj(pad.wx+dx,pad.y,pad.wz+dz);
+      const b = proj(pad.wx+dx,pad.y+4,pad.wz+dz);
+      if(a&&b) vLine(a.x,a.y,b.x,b.y,'#00ffcc',14,1.5);
+    });
+  });
+}
+
+function drawLander() {
+  if(lander.dead) return;
+  const s = lander.scale;
+
+  LANDER_GEOM.edges.forEach(([a,b])=>{
+    const ra = applyRotation(vscale(a,s), lander.pitch, lander.yaw, lander.roll);
+    const rb = applyRotation(vscale(b,s), lander.pitch, lander.yaw, lander.roll);
+    const wa = vadd(lander.pos, ra);
+    const wb = vadd(lander.pos, rb);
+    const pa = proj(wa.x,wa.y,wa.z);
+    const pb = proj(wb.x,wb.y,wb.z);
+    if(pa&&pb) vLine(pa.x,pa.y,pb.x,pb.y,'#00ff78',14,2);
+  });
+
+  // Thrust flame
+  if(lander.thrusting && lander.fuel > 0) {
+    const up = applyRotation(v3(0,1,0), lander.pitch, lander.yaw, lander.roll);
+    const nozzle = vadd(lander.pos, applyRotation(vscale(v3(0,-0.9,0),s), lander.pitch, lander.yaw, lander.roll));
+    const fl = 2.5 + Math.random()*2;
+    for(let i=0;i<5;i++){
+      const scatter = v3((Math.random()-.5)*1.2,0,(Math.random()-.5)*1.2);
+      const tip = vadd(nozzle, vscale(vadd(vscale(up,-fl), scatter), 1));
+      const pn = proj(nozzle.x,nozzle.y,nozzle.z);
+      const pt = proj(tip.x,tip.y,tip.z);
+      if(pn&&pt) vLine(pn.x,pn.y,pt.x,pt.y,'#ffee00',20,1.5);
+    }
+  }
+}
+
+function drawParticles() {
+  particles.forEach(pt => {
+    const p = proj(pt.pos.x, pt.pos.y, pt.pos.z);
+    const pv = proj(pt.pos.x-pt.vel.x*3, pt.pos.y-pt.vel.y*3, pt.pos.z-pt.vel.z*3);
+    if(!p||!pv) return;
+    const col = pt.type==='thrust'?`rgba(255,200,60,${pt.life*0.8})`:
+                pt.type==='exp'   ?`rgba(255,80,10,${pt.life})`:`rgba(0,255,180,${pt.life})`;
+    ctx.save();
+    ctx.strokeStyle=col; ctx.shadowColor=col; ctx.shadowBlur=8;
+    ctx.lineWidth=1.5; ctx.globalAlpha=pt.life;
+    ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(pv.x,pv.y); ctx.stroke();
+    ctx.restore();
+  });
+}
+
+
+// ═══════════════════════════════════════════════════════
+//  TOP-DOWN MINIMAP
+// ═══════════════════════════════════════════════════════
+function drawHUD() {
+  if(state !== 'playing' && state !== 'landed') return;
+  const p   = getP();
+  const sp  = W * 0.013;
+  const pad = sp * 1.5;
+
+  // ── TOP ROW layout ──────────────────────────────────────────────
+  // Three widgets side by side near top-center:
+  //   [ATTITUDE]   [gap]   [TOPDOWN MAP]
+  // Both same height, centered as a group
+
+  const widgetH  = Math.round(W * 0.095);   // height of each widget
+  const widgetW  = widgetH;                  // square
+  const gutter   = Math.round(sp * 2.5);
+  const rowY     = Math.round(sp * 1.8);     // top margin
+
+  // Center the two widgets + gap as a group
+  const groupW   = widgetW * 2 + gutter;
+  const groupX   = Math.round(W/2 - groupW/2);
+
+  const ahX  = groupX;                        // attitude: left widget
+  const tdX  = groupX + widgetW + gutter;     // topdown:  right widget
+  const topY = rowY;
+
+  // ── 1. ATTITUDE INDICATOR ────────────────────────────────────────
+  {
+    const cx = ahX + widgetW/2, cy = topY + widgetH/2;
+    const r  = widgetH * 0.42;
+
+    // dark bg
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.70)';
+    ctx.beginPath(); ctx.arc(cx, cy, r + 3, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+
+    // clipping circle
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.clip();
+
+    // roll / pitch state
+    const hroll  = lander.roll;
+    const hpitch = lander.pitch;
+
+    // horizon line across full clip diameter
+    const cosR = Math.cos(hroll), sinR = Math.sin(hroll);
+    const pitchOffset = hpitch * r * 1.6;
+    const hx1 = cx + (-r - 2) * cosR - pitchOffset * sinR;
+    const hy1 = cy + (-r - 2) * sinR + pitchOffset * cosR;
+    const hx2 = cx + ( r + 2) * cosR - pitchOffset * sinR;
+    const hy2 = cy + ( r + 2) * sinR + pitchOffset * cosR;
+    vLine(hx1, hy1, hx2, hy2, '#00ff78', 10, 1.8);
+
+    // pitch ladder lines (±10°, ±20°)
+    for(let deg of [-20,-10,10,20]) {
+      const off = (deg/30) * r + pitchOffset;
+      const len = r * (Math.abs(deg)===10 ? 0.35 : 0.55);
+      const ox = -off * sinR, oy = off * cosR;
+      const dx =  len * cosR, dy = len * sinR;
+      vLine(cx+ox-dx, cy+oy-dy, cx+ox+dx, cy+oy+dy, '#00ff78', 4, 0.8, 0.5);
+    }
+
+    ctx.restore(); // end clip
+
+    // outer border ring
+    for(let i=0;i<36;i++){
+      const a1=i/36*Math.PI*2, a2=(i+1)/36*Math.PI*2;
+      vLine(cx+Math.cos(a1)*r, cy+Math.sin(a1)*r,
+            cx+Math.cos(a2)*r, cy+Math.sin(a2)*r, '#1a6a30', 4, 0.8);
+    }
+
+    // fixed lander crosshair (always centered)
+    const arm = r * 0.28;
+    vLine(cx - arm*1.6, cy, cx - arm*0.35, cy, '#ffcc00', 8, 1.5);
+    vLine(cx + arm*0.35, cy, cx + arm*1.6, cy, '#ffcc00', 8, 1.5);
+    vLine(cx, cy - arm*0.5, cx, cy + arm*0.5, '#ffcc00', 8, 1.5);
+    // center dot
+    ctx.save(); ctx.fillStyle='#ffcc00'; ctx.shadowColor='#ffcc00'; ctx.shadowBlur=8;
+    ctx.globalAlpha=1; ctx.beginPath(); ctx.arc(cx,cy,2,0,Math.PI*2); ctx.fill(); ctx.restore();
+
+    // roll tick at top
+    const tickA = hroll;
+    const tx = cx + Math.sin(tickA) * (r - 2);
+    const ty = cy - Math.cos(tickA) * (r - 2);
+    vLine(cx + Math.sin(tickA)*r*0.82, cy - Math.cos(tickA)*r*0.82, tx, ty, '#ffcc00', 6, 1.2);
+
+    // label
+    vText('ATT', cx, topY - 5, 9, '#1a6a30', 4);
+  }
+
+  // ── 2. TOP-DOWN MINI MAP (hidden — kept for reference) ───────────
+  if(false) {
+  {
+    const HALF  = TERRAIN_SIZE * 0.5;
+    const mscale = widgetW / TERRAIN_SIZE;
+    const mx = tdX, my = topY;
+    const mw = widgetW, mh = widgetH;
+
+    // dark bg
+    ctx.save(); ctx.fillStyle='rgba(0,0,0,0.70)';
+    ctx.fillRect(mx, my, mw, mh); ctx.restore();
+
+    // clip to map rect
+    ctx.save();
+    ctx.beginPath(); ctx.rect(mx, my, mw, mh); ctx.clip();
+
+    // sparse terrain grid
+    const N = terrain.N, step = 3;
+    for(let iz=0;iz<N;iz+=step){
+      for(let ix=0;ix<N-1;ix++){
+        const wx1=(ix/(N-1)-0.5)*TERRAIN_SIZE,  wz1=(iz/(N-1)-0.5)*TERRAIN_SIZE;
+        const wx2=((ix+1)/(N-1)-0.5)*TERRAIN_SIZE;
+        const h=terrain.heights[iz][ix];
+        const bright=Math.max(0.12,Math.min(0.55,0.12+(h+12)/35));
+        ctx.save(); ctx.strokeStyle='#00ff78'; ctx.shadowColor='#00ff78';
+        ctx.shadowBlur=1.5; ctx.lineWidth=0.5; ctx.globalAlpha=bright;
+        ctx.beginPath();
+        ctx.moveTo(mx+(wx1+HALF)*mscale, my+(wz1+HALF)*mscale);
+        ctx.lineTo(mx+(wx2+HALF)*mscale, my+(wz1+HALF)*mscale);
+        ctx.stroke(); ctx.restore();
+      }
+    }
+    for(let ix=0;ix<N;ix+=step){
+      for(let iz=0;iz<N-1;iz++){
+        const wx1=(ix/(N-1)-0.5)*TERRAIN_SIZE,  wz1=(iz/(N-1)-0.5)*TERRAIN_SIZE;
+        const wz2=((iz+1)/(N-1)-0.5)*TERRAIN_SIZE;
+        const h=terrain.heights[iz][ix];
+        const bright=Math.max(0.12,Math.min(0.55,0.12+(h+12)/35));
+        ctx.save(); ctx.strokeStyle='#00ff78'; ctx.shadowColor='#00ff78';
+        ctx.shadowBlur=1.5; ctx.lineWidth=0.5; ctx.globalAlpha=bright;
+        ctx.beginPath();
+        ctx.moveTo(mx+(wx1+HALF)*mscale, my+(wz1+HALF)*mscale);
+        ctx.lineTo(mx+(wx1+HALF)*mscale, my+(wz2+HALF)*mscale);
+        ctx.stroke(); ctx.restore();
+      }
+    }
+
+    // pads
+    terrain.pads.forEach(pad=>{
+      const pr=(pad.r+0.5)*(TERRAIN_SIZE/N)*mscale;
+      const px=mx+(pad.wx+HALF)*mscale, pz=my+(pad.wz+HALF)*mscale;
+      ctx.save(); ctx.strokeStyle='#00ffcc'; ctx.shadowColor='#00ffcc';
+      ctx.shadowBlur=7; ctx.lineWidth=1.2; ctx.globalAlpha=0.9;
+      ctx.beginPath(); ctx.arc(px,pz,Math.max(2,pr),0,Math.PI*2); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(px-pr,pz); ctx.lineTo(px+pr,pz); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(px,pz-pr); ctx.lineTo(px,pz+pr); ctx.stroke();
+      ctx.restore();
+    });
+
+    // lander blip + heading + velocity
+    if(!lander.dead){
+      const lbx=mx+(lander.pos.x+HALF)*mscale;
+      const lbz=my+(lander.pos.z+HALF)*mscale;
+      const dotR=Math.max(2.5, mw*0.035);
+
+      // velocity vector
+      const velScale=9;
+      ctx.save(); ctx.strokeStyle='#ff8800'; ctx.shadowColor='#ff8800';
+      ctx.shadowBlur=5; ctx.lineWidth=0.9; ctx.globalAlpha=0.7;
+      ctx.beginPath(); ctx.moveTo(lbx,lbz);
+      ctx.lineTo(lbx+lander.vel.x*mscale*velScale, lbz+lander.vel.z*mscale*velScale);
+      ctx.stroke(); ctx.restore();
+
+      // heading arrow
+      const arrowLen=dotR*2.2;
+      ctx.save(); ctx.strokeStyle='#ffee00'; ctx.shadowColor='#ffee00';
+      ctx.shadowBlur=8; ctx.lineWidth=1.2; ctx.globalAlpha=0.9;
+      ctx.beginPath(); ctx.moveTo(lbx,lbz);
+      ctx.lineTo(lbx+Math.sin(lander.yaw)*arrowLen, lbz+Math.cos(lander.yaw)*arrowLen);
+      ctx.stroke(); ctx.restore();
+
+      // dot (blinks on thrust)
+      const blink=lander.thrusting?(0.6+0.4*Math.sin(frameCount*0.4)):1;
+      ctx.save(); ctx.fillStyle='#ffee00'; ctx.shadowColor='#ffee00';
+      ctx.shadowBlur=12; ctx.globalAlpha=blink;
+      ctx.beginPath(); ctx.arc(lbx,lbz,dotR,0,Math.PI*2); ctx.fill(); ctx.restore();
+    }
+
+    ctx.restore(); // end clip
+
+    // border
+    vLine(mx,my,mx+mw,my,'#1a6a30',5,0.9);
+    vLine(mx+mw,my,mx+mw,my+mh,'#1a6a30',5,0.9);
+    vLine(mx+mw,my+mh,mx,my+mh,'#1a6a30',5,0.9);
+    vLine(mx,my+mh,mx,my,'#1a6a30',5,0.9);
+
+    vText('MAP', mx+mw/2, topY - 5, 9, '#1a6a30', 4);
+  }
+
+  } // end hidden minimap
+
+  // ── Telemetry (left side, vertical) ─────────────────────────────
+  {
+    const fs  = Math.max(9, sp * 1.0);
+    const tlx = pad + sp*3;
+    const speed = vlen(lander.vel);
+    const vy    = lander.vel.y;
+    const alt   = Math.max(0, lander.pos.y - terrainWorldY(lander.pos.x,lander.pos.z)).toFixed(1);
+    const safeVy = vy > -p.safeVY;
+    const lines = [
+      ['ALT', alt,                      '#00ff78'],
+      ['VY ', vy.toFixed(2),            safeVy?'#00ff78':'#ff4400'],
+      ['SPD', speed.toFixed(2),         speed<p.safeVXZ+0.5?'#00ff78':'#ff4400'],
+      ['SCR', score,                    '#80ffbb'],
+      ['D  ', difficulty,               '#80ffbb'],
+    ];
+    lines.forEach(([label,val,col],i)=>{
+      const y = H*0.12 + i*(fs+5);
+      vText(label, tlx,       y, fs, '#1a6a30', 4);
+      vText(String(val), tlx+sp*5, y, fs, col,      8);
+    });
+  }
+
+  // ── Fuel bar (right side) ────────────────────────────────────────
+  {
+    const bx = W - pad - sp*2;
+    const by = H*0.08, bh = H*0.75, bw = sp*1.2;
+    const pct  = Math.max(0, lander.fuel/p.initFuel);
+    const fcol = pct>0.4?'#00ff78':pct>0.2?'#ffcc00':'#ff4400';
+    ctx.save(); ctx.strokeStyle='#0a3018'; ctx.lineWidth=1; ctx.globalAlpha=0.6;
+    ctx.strokeRect(bx-bw,by,bw,bh); ctx.restore();
+    const ticks=20, th=(bh-4)/ticks;
+    const filled=Math.round(pct*ticks);
+    for(let i=0;i<filled;i++){
+      const ty=by+bh-2-i*th;
+      ctx.save(); ctx.fillStyle=fcol; ctx.shadowColor=fcol;
+      ctx.shadowBlur=pct<0.2?12*(0.5+0.5*Math.sin(frameCount*0.25)):8;
+      ctx.globalAlpha=0.82; ctx.fillRect(bx-bw+2,ty-th+2,bw-4,th-2); ctx.restore();
+    }
+    vLine(bx-bw,by,bx,by,fcol,5,1); vLine(bx-bw,by+bh,bx,by+bh,fcol,5,1);
+    vLine(bx-bw,by,bx-bw,by+bh,fcol,5,1); vLine(bx,by,bx,by+bh,fcol,5,1);
+    vText('F',bx-bw/2,by-7,10,fcol,7);
+  }
+
+  // ── GPWS Proximity System — positioned below ATT widget ───────────
+  if(state==='playing') {
+    const tgy  = terrainWorldY(lander.pos.x, lander.pos.z);
+    const altN = Math.max(0, lander.pos.y - tgy);
+
+    // Build callout list: every 10m up to 100, then TERRAIN at <=5
+    const callouts = [];
+    for(let a = 100; a >= 10; a -= 10) {
+      const frac = 1 - (a / 100);            // 0=far, 1=close
+      const r2g  = Math.round(255 * frac);
+      const g2r  = Math.round(255 * (1-frac));
+      callouts.push({
+        alt:   a,
+        label: String(a),
+        col:   `rgb(${r2g},${Math.max(80,g2r)},0)`,
+        blink: a <= 30 ? 0.06 + (30-a)*0.008 : 0,
+      });
+    }
+    callouts.push({ alt: 5, label: 'TERRAIN', col: '#ff1100', blink: 0.40 });
+
+    // Active = deepest triggered tier
+    let active = null;
+    for(const c of callouts) { if(altN <= c.alt) active = c; }
+
+    if(active) {
+      const blinkOn = active.blink > 0
+        ? (Math.sin(frameCount * active.blink * Math.PI * 2) > 0)
+        : true;
+
+      if(blinkOn) {
+        const isTerrainWarn = active.alt <= 5;
+        const fontSize = isTerrainWarn ? Math.round(W * 0.042) : Math.round(W * 0.030);
+
+        // Position: centred horizontally, just below the ATT widget
+        const gpwsY = rowY + widgetH + Math.round(sp * 3.5);
+
+        // Glow text — 3 passes
+        ctx.save();
+        ctx.font = `bold ${fontSize}px 'Share Tech Mono', monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillStyle   = active.col;
+        ctx.shadowColor = active.col;
+        [28, 10, 3].forEach((blur, i) => {
+          ctx.shadowBlur  = blur;
+          ctx.globalAlpha = i===0 ? 0.25 : i===1 ? 0.7 : 1.0;
+          ctx.fillText(active.label, W/2, gpwsY);
+        });
+        ctx.restore();
+
+        // Small chevrons flanking the label (tighter, near the text)
+        const labelW = ctx.measureText ? 0 : 0;  // unused
+        const chevSize = fontSize * 0.55;
+        const chevGap  = fontSize * (isTerrainWarn ? 3.5 : 2.2);
+        for(const side of [-1, 1]) {
+          const cx2 = W/2 + side * chevGap;
+          const cy2 = gpwsY - fontSize * 0.3;
+          ctx.save();
+          ctx.strokeStyle = active.col; ctx.shadowColor = active.col;
+          ctx.shadowBlur = 10; ctx.lineWidth = 2; ctx.globalAlpha = 0.85;
+          ctx.beginPath();
+          ctx.moveTo(cx2 - chevSize*0.5, cy2 - chevSize*0.4);
+          ctx.lineTo(cx2,                cy2 + chevSize*0.4);
+          ctx.lineTo(cx2 + chevSize*0.5, cy2 - chevSize*0.4);
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        // Border flash only for TERRAIN
+        if(isTerrainWarn) {
+          ctx.save();
+          ctx.strokeStyle = active.col; ctx.shadowColor = active.col; ctx.shadowBlur = 24;
+          ctx.lineWidth = 3; ctx.globalAlpha = 0.65;
+          ctx.strokeRect(3, 3, W-6, H-6);
+          ctx.restore();
+        }
+      }
+    }
+  }
+
+  // ── Topview indicator ───────────────────────────────────────────
+  if(topviewT > 0.02) {
+    const tv = Math.min(1, topviewT);
+    const barW = W * 0.18 * tv;
+    const barX = W/2 - W*0.09;
+    const barY = H - 18;
+    // bg track
+    ctx.save(); ctx.fillStyle='rgba(0,50,20,0.5)'; ctx.fillRect(barX-1, barY-5, W*0.18+2, 9); ctx.restore();
+    // fill
+    ctx.save(); ctx.fillStyle='#00ffcc'; ctx.shadowColor='#00ffcc'; ctx.shadowBlur=10;
+    ctx.globalAlpha=0.8+0.2*Math.sin(frameCount*0.15);
+    ctx.fillRect(barX, barY-4, barW, 7); ctx.restore();
+    vText('OVERHEAD VIEW', W/2, barY+14, 9, '#00ffcc', 8);
+  }
+
+  // ── Gamepad hint ─────────────────────────────────────────────────
+  if(!gamepadConnected){
+    vText('ARROWS:TILT  WASD:CAM  SPACE:THRUST  V:TOPVIEW  R:LEVEL', W/2, H-32, 9, '#1a4a2a', 4);
+  } else {
+    if(topviewT < 0.02) vText('R3:OVERHEAD  L3:LEVEL', W/2, H-14, 9, '#1a4a2a', 4);
+  }
+}
+
+// Stars (3D positions on a distant sphere)
+const stars3d = Array.from({length:120},()=>{
+  const a=Math.random()*Math.PI*2, b=(Math.random()-.5)*Math.PI;
+  const r=350+Math.random()*100;
+  return v3(Math.cos(b)*Math.cos(a)*r, Math.sin(b)*r, Math.cos(b)*Math.sin(a)*r);
+});
+
+function drawStars() {
+  stars3d.forEach(s=>{
+    const p=project(s,camPos,camYaw,camPitch);
+    if(!p)return;
+    const f=0.3+0.7*(Math.sin(frameCount*0.03+s.x*0.01)*0.5+0.5);
+    ctx.save(); ctx.fillStyle='#00ff78'; ctx.shadowColor='#00ff78';
+    ctx.shadowBlur=4; ctx.globalAlpha=f*0.55;
+    ctx.beginPath(); ctx.arc(p.x,p.y,0.9,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+  });
+}
+
+// ─── Overlay ──────────────────────────────────────────
+const overlayEl = (() => {
+  const d=document.createElement('div');
+  d.style.cssText=`position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;z-index:200;font-family:'Share Tech Mono',monospace;pointer-events:none;`;
+  document.body.appendChild(d); return d;
+})();
+
+const diffEl = (() => {
+  const d=document.createElement('div');
+  d.style.cssText=`position:fixed;bottom:40px;left:50%;transform:translateX(-50%);
+    display:flex;flex-direction:column;align-items:center;gap:8px;z-index:200;`;
+  // Label
+  const lbl=document.createElement('div');
+  lbl.textContent='DIFFICULTY';
+  lbl.style.cssText='color:#2a6a3a;font-size:11px;letter-spacing:4px;font-family:"Share Tech Mono",monospace;';
+  d.appendChild(lbl);
+  const row=document.createElement('div');
+  row.id='diffRow';
+  row.style.cssText='display:flex;gap:6px;';
+  for(let i=1;i<=9;i++){
+    const b=document.createElement('button');
+    b.textContent=i;
+    b.style.cssText=`width:32px;height:32px;background:transparent;
+      border:1.5px solid #006633;color:#00ff78;font-family:"Share Tech Mono",monospace;
+      font-size:13px;cursor:pointer;pointer-events:all;
+      box-shadow:0 0 6px rgba(0,255,120,0.2);transition:all .1s;`;
+    if(i===1) { b.style.background='#00ff78'; b.style.color='#000'; b.style.boxShadow='0 0 16px #00ff78'; }
+    b.addEventListener('click',e=>{
+      e.stopPropagation();
+      difficulty=i;
+      row.querySelectorAll('button').forEach(x=>{x.style.background='transparent';x.style.color='#00ff78';x.style.boxShadow='0 0 6px rgba(0,255,120,0.2)';});
+      b.style.background='#00ff78'; b.style.color='#000'; b.style.boxShadow='0 0 16px #00ff78';
+    });
+    row.appendChild(b);
+  }
+  d.appendChild(row);
+  document.body.appendChild(d);
+  return d;
+})();
+
+function showOverlay(title, sub) {
+  overlayEl.style.display='flex';
+  overlayEl.innerHTML=`
+    <h1 style="color:#00ff78;font-size:clamp(20px,4vw,36px);letter-spacing:6px;line-height:1.5;text-align:center;
+      text-shadow:0 0 12px #00ff78,0 0 30px #00ff78;animation:flicker 3s infinite;">${title.replace('\n','<br>')}</h1>
+    <p style="color:#80ffbb;font-size:12px;letter-spacing:3px;margin-top:16px;animation:blink 1s infinite;">${sub}</p>
+  `;
+  diffEl.style.display='flex';
+  // Resume chiptune on game-over/landed screens if audio is on
+  if(audioEnabled && audioReady && !musicPlaying) startMusic();
+}
+function hideOverlay() {
+  overlayEl.style.display='none';
+  diffEl.style.display='none';
+}
+
+// Add CSS animations
+const style=document.createElement('style');
+style.textContent=`
+  @keyframes flicker{0%,100%{opacity:1}92%{opacity:1}93%{opacity:.3}94%{opacity:1}96%{opacity:.5}97%{opacity:1}}
+  @keyframes blink{0%,49%{opacity:1}50%,100%{opacity:0}}
+`;
+document.head.appendChild(style);
+
+// ─── Chiptune music ──────────────────────────────────
+let musicNodes = [];
+let musicPlaying = false;
+
+function stopMusic() {
+  musicNodes.forEach(n => { try { n.stop(); } catch(e){} });
+  musicNodes = [];
+  musicPlaying = false;
+}
+
+function startMusic() {
+  if(musicPlaying || !audioCtx) return;
+  musicPlaying = true;
+  const ac = audioCtx;
+  const master = ac.createGain();
+  master.gain.value = 0.18;
+  master.connect(ac.destination);
+
+  // Simple chiptune sequence — two voices
+  // Melody: A minor pentatonic-ish, 8-note loop
+  const BPM = 128, beat = 60/BPM;
+  const melody = [220,261,293,349,392,440,392,349, 261,220,196,175,196,220,293,261];
+  const bass   = [110,110,130,110, 98,110,130,98];
+
+  function scheduleVoice(notes, startT, noteDur, vol, wave, loopLen) {
+    const g = ac.createGain(); g.gain.value = vol; g.connect(master);
+    let t = startT;
+    const totalBeats = loopLen || notes.length;
+    function scheduleLoop() {
+      const loopStart = t;
+      for(let i = 0; i < notes.length; i++) {
+        const osc = ac.createOscillator();
+        osc.type = wave;
+        osc.frequency.value = notes[i];
+        const env = ac.createGain();
+        env.gain.setValueAtTime(0, t);
+        env.gain.linearRampToValueAtTime(1, t + 0.01);
+        env.gain.linearRampToValueAtTime(0, t + noteDur * 0.8);
+        osc.connect(env); env.connect(g);
+        osc.start(t); osc.stop(t + noteDur);
+        musicNodes.push(osc);
+        t += noteDur;
+      }
+      // Schedule next loop
+      const loopDur = notes.length * noteDur;
+      const tid = setTimeout(scheduleLoop, (loopDur - 0.3) * 1000);
+      musicNodes.push({ stop: () => clearTimeout(tid) });
+    }
+    scheduleLoop();
+  }
+
+  const now = ac.currentTime + 0.05;
+  scheduleVoice(melody, now,        beat * 0.5, 0.7, 'square',   16);
+  scheduleVoice(bass,   now,        beat * 1.0, 0.5, 'square',    8);
+  scheduleVoice([110,0,130,0,98,0,130,0], now + beat*0.5, beat*0.5, 0.3, 'triangle', 8);
+}
+
+// ─── Mute button (small, in-game) ────────────────────
+const muteBtn = document.createElement('button');
+muteBtn.textContent = '♪';
+muteBtn.style.cssText = `
+  position:fixed; bottom:16px; right:16px; z-index:300;
+  background:transparent; border:1.5px solid #006633;
+  color:#00ff78; font-family:'Share Tech Mono',monospace;
+  font-size:16px; width:32px; height:32px; cursor:pointer;
+  box-shadow:0 0 6px rgba(0,255,120,0.25);
+  opacity:0.6; transition:all 0.15s;
+`;
+muteBtn.addEventListener('mouseenter', ()=>{ muteBtn.style.opacity='1'; muteBtn.style.boxShadow='0 0 12px #00ff78'; });
+muteBtn.addEventListener('mouseleave', ()=>{ muteBtn.style.opacity='0.6'; muteBtn.style.boxShadow='0 0 6px rgba(0,255,120,0.25)'; });
+muteBtn.addEventListener('click', e => {
+  e.stopPropagation();
+  audioEnabled = !audioEnabled;
+  muteBtn.textContent = audioEnabled ? '♪' : '✕';
+  muteBtn.style.color = audioEnabled ? '#00ff78' : '#ff4400';
+  muteBtn.style.borderColor = audioEnabled ? '#006633' : '#661100';
+  if(audioEnabled) { if(state==='title') startMusic(); }
+  else stopMusic();
+});
+document.body.appendChild(muteBtn);
+
+// ─── BIG SOUND ON button on title screen ─────────────
+const soundOnBtn = document.createElement('button');
+soundOnBtn.id = 'soundOnBtn';
+soundOnBtn.innerHTML = '&#9835; SOUND ON';
+soundOnBtn.style.cssText = `
+  margin-top:24px; padding:10px 28px;
+  background:transparent; border:2px solid #00ff78;
+  color:#00ff78; font-family:'Share Tech Mono',monospace;
+  font-size:14px; letter-spacing:4px; cursor:pointer;
+  pointer-events:all;
+  box-shadow:0 0 14px rgba(0,255,120,0.4), inset 0 0 14px rgba(0,255,120,0.05);
+  text-shadow:0 0 8px #00ff78;
+  animation:blink 1.4s infinite;
+  transition:all 0.1s;
+`;
+soundOnBtn.addEventListener('click', e => {
+  e.stopPropagation();
+  // THIS is the real user gesture that unlocks AudioContext
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  audioCtx.resume().then(() => {
+    audioReady = true;
+    audioEnabled = true;
+    muteBtn.textContent = '♪';
+    muteBtn.style.color = '#00ff78';
+    muteBtn.style.borderColor = '#006633';
+    startMusic();
+  });
+  soundOnBtn.style.display = 'none';
+});
+// Inject into overlay after it's shown
+function injectSoundBtn() {
+  const existing = document.getElementById('soundOnBtn');
+  if(existing) existing.remove();
+  overlayEl.appendChild(soundOnBtn);
+}
+
+// ─── Title screen init ───────────────────────────────
+terrain = genTerrain(3);
+camPos  = v3(0, 80, 120);
+camYaw  = 0; camPitch = 0.35;
+lander  = { pos:v3(0,30,0), vel:v3(0,0,0), pitch:0.2, yaw:0, roll:0.1, fuel:100, thrusting:false, dead:false, scale:1.8 };
+showOverlay('LUNAR LANDER 3D', 'CONNECT GAMEPAD & PRESS A / SPACE');
+injectSoundBtn();
+
+// Title animation
+let titleT=0;
+
+// ─── Input on overlay ───────────────────────────────
+document.addEventListener('keydown', e=>{
+  if(e.code==='Space'||(e.code==='Enter')) {
+    if(state==='title'||state==='dead'||state==='landed') initGame();
+  }
+});
+
+// ─── Main Loop ───────────────────────────────────────
+function loop() {
+  ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+
+  // Gamepad button check for start
+  const gp=getGamepad();
+  if(gp&&(gpBtn(gp,0)||gpBtn(gp,9))&&(state==='title'||state==='dead'||state==='landed')) {
+    initGame();
+  }
+
+  if(state==='title') {
+    titleT+=0.012;
+    // Slowly orbit camera over terrain
+    camYaw   = titleT;
+    camPos   = v3(Math.sin(titleT)*100, 70, Math.cos(titleT)*100);
+    camPitch = 0.4;
+    lander.yaw   = titleT*0.5;
+    lander.pitch = Math.sin(titleT*0.7)*0.2;
+    lander.roll  = Math.sin(titleT*0.5)*0.15;
+    lander.pos   = v3(Math.sin(titleT*1.3)*15, 25+Math.sin(titleT*0.9)*5, Math.cos(titleT*1.1)*15);
+    lander.thrusting = Math.sin(titleT*3) > 0.3;
+  }
+
+  drawStars();
+  drawTerrain();
+  drawParticles();
+  drawLander();
+  if(state!=='title') drawHUD();
+
+  update();
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
