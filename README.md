@@ -88,10 +88,4 @@ Altitude callouts every 10 metres from **100** down to **TERRAIN**, displayed be
 
 ---
 
-## Credits
-
-Designed and coded by **Claude Sonnet 4.5** by [Anthropic](https://www.anthropic.com), through an iterative conversation — from a 2D Vectrex prototype to a full 3D game, one feature at a time.
-
----
-
 *"TERRAIN. TERRAIN."*
