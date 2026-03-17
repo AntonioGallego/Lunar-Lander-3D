@@ -2,13 +2,15 @@
 
 > A 3D wireframe lunar lander built in a single HTML file, rendered in authentic Vectrex phosphor-glow vector style. Full 6DOF physics with gravity, thrust and auto-leveling. Left stick tilts the lander, right stick orbits the camera freely, R3 provides smooth overhead view. Procedurally generated terrain. GPWS proximity system with color-coded blinking warnings. 
 
-**Built entirely by [Claude Sonnet 4.5](https://www.anthropic.com/claude) (Anthropic)**
+<img width="1245" height="1061" alt="imagen" src="https://github.com/user-attachments/assets/721ae7fb-e7a8-444c-a3d3-46cbaedab5c6" />
 
 ---
 
 ## Play
 
 Open `lunar-lander-3d.html` in any modern browser. No build step, no dependencies, no install.
+
+<img width="1123" height="1007" alt="imagen" src="https://github.com/user-attachments/assets/76c81fe1-d804-453a-849d-33a32e0f0acf" />
 
 ---
 
