@@ -89,3 +89,12 @@ Altitude callouts every 10 metres from **100** down to **TERRAIN**, displayed be
 ---
 
 *"TERRAIN. TERRAIN."*
+
+---
+
+## License
+
+Copyright (C) 2026 Antonio Gallego de Torres
+
+This project is licensed under the GNU Affero General Public License v3.0 —
+see the [LICENSE](LICENSE) file for details.
